@@ -28,53 +28,56 @@ export class DocumentController {
 
       this.logger.info(`Converting Word to PDF natively via LibreOffice...`);
       
-      const jobId = Date.now() + Math.floor(Math.random() * 1000);
+      const uniqueId = Date.now() + Math.floor(Math.random() * 1000);
       const ext = path.extname(targetFile.originalname) || '.docx';
       
-      // 1. Unique Work Dir
-      const baseTmp = os.tmpdir();
-      const jobDir = path.join(baseTmp, `job_${jobId}`);
-      if (!fs.existsSync(jobDir)) {
-        fs.mkdirSync(jobDir, { recursive: true });
-      }
+      const workDir = `/tmp/word_to_pdf_job_${uniqueId}`;
+      const inputPath = path.join(workDir, `input${ext}`);
+      const outputPath = path.join(workDir, 'input.pdf');
 
-      // 2. Copy File
-      const inputPath = path.join(jobDir, `input${ext}`);
-      fs.copyFileSync(targetFile.path, inputPath);
+      try {
+        // 1. Create temporary working directory
+        if (!fs.existsSync(workDir)) fs.mkdirSync(workDir, { recursive: true });
 
-      // 3. Run Command
-      // Adding user installation to the unique job dir ensures it won't conflict or detach
-      const profilePath = path.join(jobDir, 'lo_profile');
-      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --convert-to pdf --outdir "${jobDir}" "${inputPath}"`;
-      
-      // 4. Wait & Send
-      await execPromise(cmd);
+        // 2. Move uploaded file to our work directory
+        // req.file.path is multer's temp path
+        fs.renameSync(targetFile.path, inputPath);
 
-      const baseName = path.basename(inputPath, ext);
-      const outputPath = path.join(jobDir, `${baseName}.pdf`);
+        this.logger.info(`[INFO] Converting: ${inputPath}`);
 
-      if (!fs.existsSync(outputPath)) {
-        throw new Error(`File conversion failed, output file does not exist at ${outputPath}`);
-      }
+        // 3. Run LibreOffice with unique profile to avoid crashes
+        const command = `libreoffice --headless "-env:UserInstallation=file:///tmp/libo_profile_${uniqueId}" --nologo --norestore --convert-to pdf "${inputPath}" --outdir "${workDir}"`;
+        
+        await execPromise(command);
 
-      const stat = fs.statSync(outputPath);
-      if (stat.size === 0) {
-        throw new Error('Converted file is empty (size 0).');
-      }
+        // 4. Double check if file exists and has content
+        if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            const fileName = targetFile.originalname.replace(/\.(docx|doc)$/i, '.pdf');
+            res.setHeader('Content-Type', 'application/pdf');
+            res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
 
-      const fileName = targetFile.originalname.replace(/\.(docx|doc)$/i, '.pdf');
-
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-      
-      res.sendFile(outputPath, (err) => {
-        // 5. Clean
-        fs.rmSync(jobDir, { recursive: true, force: true });
-        if (targetFile.path && fs.existsSync(targetFile.path)) {
-          fs.rmSync(targetFile.path, { force: true });
+            res.sendFile(outputPath, (err) => {
+                // 5. Cleanup AFTER sending the file
+                setTimeout(() => {
+                    fs.rmSync(workDir, { recursive: true, force: true });
+                    const profilePath = `/tmp/libo_profile_${uniqueId}`;
+                    if (fs.existsSync(profilePath)) fs.rmSync(profilePath, { recursive: true, force: true });
+                    this.logger.info(`[CLEANUP] Job ${uniqueId} removed.`);
+                }, 5000);
+            });
+        } else {
+            throw new Error("LibreOffice output is empty or missing");
         }
-      });
-
+      } catch (error: any) {
+        this.logger.error(`[ERROR]:`, error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Conversion failed", details: error.message });
+        }
+        // Cleanup on error too
+        if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
+        const profilePath = `/tmp/libo_profile_${uniqueId}`;
+        if (fs.existsSync(profilePath)) fs.rmSync(profilePath, { recursive: true, force: true });
+      }
     } catch (error) {
       next(error);
     }
@@ -153,50 +156,54 @@ export class DocumentController {
 
       this.logger.info(`Converting PDF to DOCX natively via LibreOffice...`);
       
-      const jobId = Date.now() + Math.floor(Math.random() * 1000);
-      
-      // 1. Unique Work Dir
-      const baseTmp = os.tmpdir();
-      const jobDir = path.join(baseTmp, `job_${jobId}`);
-      if (!fs.existsSync(jobDir)) {
-        fs.mkdirSync(jobDir, { recursive: true });
-      }
+      const uniqueId = Date.now() + Math.floor(Math.random() * 1000);
+      const workDir = `/tmp/pdf_job_${uniqueId}`;
+      const inputPath = path.join(workDir, 'input.pdf');
+      const outputPath = path.join(workDir, 'input.docx');
 
-      // 2. Copy File
-      const inputPath = path.join(jobDir, `input.pdf`);
-      fs.copyFileSync(targetFile.path, inputPath);
+      try {
+        // 1. Create temporary working directory
+        if (!fs.existsSync(workDir)) fs.mkdirSync(workDir, { recursive: true });
 
-      // 3. Run Command
-      const profilePath = path.join(jobDir, 'lo_profile');
-      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --infilter="writer_pdf_import" --convert-to docx:"Microsoft Word 2007-2019 XML" --outdir "${jobDir}" "${inputPath}"`;
-      
-      // 4. Wait & Send
-      await execPromise(cmd);
+        // 2. Move uploaded file to our work directory
+        // targetFile.path is multer's temp path
+        fs.renameSync(targetFile.path, inputPath);
 
-      const baseName = path.basename(inputPath, '.pdf');
-      const outputPath = path.join(jobDir, `${baseName}.docx`);
+        this.logger.info(`[INFO] Converting: ${inputPath}`);
 
-      if (!fs.existsSync(outputPath)) {
-        throw new Error(`File conversion failed, output file does not exist at ${outputPath}`);
-      }
+        // 3. Run LibreOffice with unique profile to avoid crashes
+        const command = `libreoffice --headless "-env:UserInstallation=file:///tmp/libo_profile_${uniqueId}" --infilter="writer_pdf_import" --convert-to docx "${inputPath}" --outdir "${workDir}"`;
+        
+        await execPromise(command);
 
-      const stat = fs.statSync(outputPath);
-      if (stat.size === 0) {
-        throw new Error('Converted file is empty (size 0).');
-      }
-
-      const fileName = targetFile.originalname.replace(/\.pdf$/i, '.docx');
-
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-      
-      res.sendFile(outputPath, (err) => {
-        // 5. Clean
-        fs.rmSync(jobDir, { recursive: true, force: true });
-        if (targetFile.path && fs.existsSync(targetFile.path)) {
-          fs.rmSync(targetFile.path, { force: true });
+        // 4. Double check if file exists and has content
+        if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            const fileName = targetFile.originalname.replace(/\.pdf$/i, '.docx');
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+            res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+            
+            res.sendFile(outputPath, (err) => {
+                // 5. Cleanup AFTER sending the file
+                setTimeout(() => {
+                    fs.rmSync(workDir, { recursive: true, force: true });
+                    const profilePath = `/tmp/libo_profile_${uniqueId}`;
+                    if (fs.existsSync(profilePath)) fs.rmSync(profilePath, { recursive: true, force: true });
+                    this.logger.info(`[CLEANUP] Job ${uniqueId} removed.`);
+                }, 5000);
+            });
+        } else {
+            throw new Error("LibreOffice output is empty or missing");
         }
-      });
+      } catch (error: any) {
+        this.logger.error(`[ERROR]:`, error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Conversion failed", details: error.message });
+        }
+        // Cleanup on error too
+        if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
+        const profilePath = `/tmp/libo_profile_${uniqueId}`;
+        if (fs.existsSync(profilePath)) fs.rmSync(profilePath, { recursive: true, force: true });
+      }
     } catch (error) {
       next(error);
     }
