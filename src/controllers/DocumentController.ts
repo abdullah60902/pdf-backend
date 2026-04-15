@@ -31,30 +31,35 @@ export class DocumentController {
       const jobId = Date.now() + Math.floor(Math.random() * 1000);
       const ext = path.extname(targetFile.originalname) || '.docx';
       
-      const outDir = process.env.NODE_ENV === 'production' || process.platform === 'linux' 
-        ? '/root/pdf-backend/temp' 
-        : os.tmpdir();
-
-      if (!fs.existsSync(outDir)) {
-        fs.mkdirSync(outDir, { recursive: true });
+      // 1. Unique Work Dir
+      const baseTmp = os.tmpdir();
+      const jobDir = path.join(baseTmp, `job_${jobId}`);
+      if (!fs.existsSync(jobDir)) {
+        fs.mkdirSync(jobDir, { recursive: true });
       }
 
-      const inputPath = path.join(outDir, `input_${jobId}${ext}`);
-      const profilePath = path.join(outDir, `lo_profile_${jobId}`);
-      
-      // Copy uploaded file to the deterministic /tmp location
+      // 2. Copy File
+      const inputPath = path.join(jobDir, `input${ext}`);
       fs.copyFileSync(targetFile.path, inputPath);
 
-      // Execute LibreOffice command natively. We use a custom UserInstallation profile
-      // so that libreoffice never detaches even if another instance is running.
-      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --convert-to pdf --outdir "${outDir}" "${inputPath}"`;
+      // 3. Run Command
+      // Adding user installation to the unique job dir ensures it won't conflict or detach
+      const profilePath = path.join(jobDir, 'lo_profile');
+      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --convert-to pdf --outdir "${jobDir}" "${inputPath}"`;
+      
+      // 4. Wait & Send
       await execPromise(cmd);
 
       const baseName = path.basename(inputPath, ext);
-      const outputPath = path.join(outDir, `${baseName}.pdf`);
+      const outputPath = path.join(jobDir, `${baseName}.pdf`);
 
       if (!fs.existsSync(outputPath)) {
         throw new Error(`File conversion failed, output file does not exist at ${outputPath}`);
+      }
+
+      const stat = fs.statSync(outputPath);
+      if (stat.size === 0) {
+        throw new Error('Converted file is empty (size 0).');
       }
 
       const fileName = targetFile.originalname.replace(/\.(docx|doc)$/i, '.pdf');
@@ -62,16 +67,11 @@ export class DocumentController {
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
       
-      // Stream file directly to prevent early deletion or memory issues
       res.sendFile(outputPath, (err) => {
-        // Strict Cleanup AFTER sending finishes
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        // 5. Clean
+        fs.rmSync(jobDir, { recursive: true, force: true });
         if (targetFile.path && fs.existsSync(targetFile.path)) {
-          fs.unlinkSync(targetFile.path);
-        }
-        if (fs.existsSync(profilePath)) {
-          fs.rmSync(profilePath, { recursive: true, force: true });
+          fs.rmSync(targetFile.path, { force: true });
         }
       });
 
@@ -155,29 +155,34 @@ export class DocumentController {
       
       const jobId = Date.now() + Math.floor(Math.random() * 1000);
       
-      const outDir = process.env.NODE_ENV === 'production' || process.platform === 'linux' 
-        ? '/root/pdf-backend/temp' 
-        : os.tmpdir();
-
-      if (!fs.existsSync(outDir)) {
-        fs.mkdirSync(outDir, { recursive: true });
+      // 1. Unique Work Dir
+      const baseTmp = os.tmpdir();
+      const jobDir = path.join(baseTmp, `job_${jobId}`);
+      if (!fs.existsSync(jobDir)) {
+        fs.mkdirSync(jobDir, { recursive: true });
       }
 
-      const inputPath = path.join(outDir, `input_${jobId}.pdf`);
-      const profilePath = path.join(outDir, `lo_profile_${jobId}`);
-      
-      // Copy to explicit dir
+      // 2. Copy File
+      const inputPath = path.join(jobDir, `input.pdf`);
       fs.copyFileSync(targetFile.path, inputPath);
 
-      // Execute LibreOffice command natively with writer_pdf_import block
-      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --infilter="writer_pdf_import" --convert-to docx:"Microsoft Word 2007-2019 XML" --outdir "${outDir}" "${inputPath}"`;
+      // 3. Run Command
+      const profilePath = path.join(jobDir, 'lo_profile');
+      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --infilter="writer_pdf_import" --convert-to docx:"Microsoft Word 2007-2019 XML" --outdir "${jobDir}" "${inputPath}"`;
+      
+      // 4. Wait & Send
       await execPromise(cmd);
 
       const baseName = path.basename(inputPath, '.pdf');
-      const outputPath = path.join(outDir, `${baseName}.docx`);
+      const outputPath = path.join(jobDir, `${baseName}.docx`);
 
       if (!fs.existsSync(outputPath)) {
         throw new Error(`File conversion failed, output file does not exist at ${outputPath}`);
+      }
+
+      const stat = fs.statSync(outputPath);
+      if (stat.size === 0) {
+        throw new Error('Converted file is empty (size 0).');
       }
 
       const fileName = targetFile.originalname.replace(/\.pdf$/i, '.docx');
@@ -186,14 +191,10 @@ export class DocumentController {
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
       
       res.sendFile(outputPath, (err) => {
-        // Strict Cleanup AFTER sending finishes
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        // 5. Clean
+        fs.rmSync(jobDir, { recursive: true, force: true });
         if (targetFile.path && fs.existsSync(targetFile.path)) {
-          fs.unlinkSync(targetFile.path);
-        }
-        if (fs.existsSync(profilePath)) {
-          fs.rmSync(profilePath, { recursive: true, force: true });
+          fs.rmSync(targetFile.path, { force: true });
         }
       });
     } catch (error) {
