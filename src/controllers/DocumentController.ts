@@ -30,32 +30,51 @@ export class DocumentController {
       
       const jobId = Date.now() + Math.floor(Math.random() * 1000);
       const ext = path.extname(targetFile.originalname) || '.docx';
-      const outDir = os.tmpdir();
+      
+      const outDir = process.env.NODE_ENV === 'production' || process.platform === 'linux' 
+        ? '/root/pdf-backend/temp' 
+        : os.tmpdir();
+
+      if (!fs.existsSync(outDir)) {
+        fs.mkdirSync(outDir, { recursive: true });
+      }
+
       const inputPath = path.join(outDir, `input_${jobId}${ext}`);
+      const profilePath = path.join(outDir, `lo_profile_${jobId}`);
       
       // Copy uploaded file to the deterministic /tmp location
       fs.copyFileSync(targetFile.path, inputPath);
 
-      // Execute LibreOffice command natively
-      const cmd = `soffice --headless --convert-to pdf --outdir ${outDir} ${inputPath}`;
+      // Execute LibreOffice command natively. We use a custom UserInstallation profile
+      // so that libreoffice never detaches even if another instance is running.
+      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --convert-to pdf --outdir "${outDir}" "${inputPath}"`;
       await execPromise(cmd);
 
       const baseName = path.basename(inputPath, ext);
       const outputPath = path.join(outDir, `${baseName}.pdf`);
 
-      const pdfBuffer = fs.readFileSync(outputPath);
+      if (!fs.existsSync(outputPath)) {
+        throw new Error(`File conversion failed, output file does not exist at ${outputPath}`);
+      }
+
       const fileName = targetFile.originalname.replace(/\.(docx|doc)$/i, '.pdf');
 
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-      res.send(pdfBuffer);
+      
+      // Stream file directly to prevent early deletion or memory issues
+      res.sendFile(outputPath, (err) => {
+        // Strict Cleanup AFTER sending finishes
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        if (targetFile.path && fs.existsSync(targetFile.path)) {
+          fs.unlinkSync(targetFile.path);
+        }
+        if (fs.existsSync(profilePath)) {
+          fs.rmSync(profilePath, { recursive: true, force: true });
+        }
+      });
 
-      // Strict Cleanup
-      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-      if (targetFile.path && fs.existsSync(targetFile.path)) {
-        fs.unlinkSync(targetFile.path);
-      }
     } catch (error) {
       next(error);
     }
@@ -135,32 +154,48 @@ export class DocumentController {
       this.logger.info(`Converting PDF to DOCX natively via LibreOffice...`);
       
       const jobId = Date.now() + Math.floor(Math.random() * 1000);
-      const outDir = os.tmpdir();
-      const inputPath = path.join(outDir, `input_${jobId}.pdf`);
       
-      // Copy to /tmp
+      const outDir = process.env.NODE_ENV === 'production' || process.platform === 'linux' 
+        ? '/root/pdf-backend/temp' 
+        : os.tmpdir();
+
+      if (!fs.existsSync(outDir)) {
+        fs.mkdirSync(outDir, { recursive: true });
+      }
+
+      const inputPath = path.join(outDir, `input_${jobId}.pdf`);
+      const profilePath = path.join(outDir, `lo_profile_${jobId}`);
+      
+      // Copy to explicit dir
       fs.copyFileSync(targetFile.path, inputPath);
 
       // Execute LibreOffice command natively with writer_pdf_import block
-      const cmd = `soffice --headless --infilter="writer_pdf_import" --convert-to docx --outdir ${outDir} ${inputPath}`;
+      const cmd = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --infilter="writer_pdf_import" --convert-to docx:"Microsoft Word 2007-2019 XML" --outdir "${outDir}" "${inputPath}"`;
       await execPromise(cmd);
 
       const baseName = path.basename(inputPath, '.pdf');
       const outputPath = path.join(outDir, `${baseName}.docx`);
 
-      const docxBuffer = fs.readFileSync(outputPath);
+      if (!fs.existsSync(outputPath)) {
+        throw new Error(`File conversion failed, output file does not exist at ${outputPath}`);
+      }
+
       const fileName = targetFile.originalname.replace(/\.pdf$/i, '.docx');
 
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
       res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-      res.send(docxBuffer);
-
-      // Strict Cleanup
-      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-      if (targetFile.path && fs.existsSync(targetFile.path)) {
-        fs.unlinkSync(targetFile.path);
-      }
+      
+      res.sendFile(outputPath, (err) => {
+        // Strict Cleanup AFTER sending finishes
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        if (targetFile.path && fs.existsSync(targetFile.path)) {
+          fs.unlinkSync(targetFile.path);
+        }
+        if (fs.existsSync(profilePath)) {
+          fs.rmSync(profilePath, { recursive: true, force: true });
+        }
+      });
     } catch (error) {
       next(error);
     }

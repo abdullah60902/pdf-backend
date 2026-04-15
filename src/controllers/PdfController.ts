@@ -9,7 +9,11 @@ import cloudinary from '../utils/cloudinary';
 import { GitHubDB, FileMetadataRecord } from '../utils/githubDb';
 const pdfjs = require('pdfjs-dist/legacy/build/pdf.js');
 import FormData from 'form-data';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
 const GOTENBERG_URL = 'http://localhost:3000';
+const LIBREOFFICE_TEMP_DIR = '/root/pdf-backend/temp';
 
 /**
  * ENTERPRISE PDF ENGINE TYPES
@@ -719,6 +723,11 @@ export const addSignature = async (req: Request, res: Response) => {
 export const pdfToWord = async (req: Request, res: Response) => {
   const MAX_SIZE = 10 * 1024 * 1024; // 10MB Limit
 
+  // Paths for temp files — declared outside try so cleanup can always reach them
+  let inputPath = '';
+  let outputPath = '';
+  let profilePath = '';
+
   try {
     const file = req.file as Express.Multer.File;
     if (!file) return res.status(400).json({ success: false, error: 'Target file missing from payload.' });
@@ -741,23 +750,32 @@ export const pdfToWord = async (req: Request, res: Response) => {
     }
 
     const totalPages = pdfDoc.getPageCount();
-    console.log(`🚀 [Micro-Tool] High-Performance PDF to Word: ${file.originalname}`);
+    console.log(`🚀 [PDF→Word] Starting conversion: ${file.originalname} (${totalPages} pages)`);
 
-    // Stream-based processing for 1GB RAM efficiency
-    const formData = new FormData();
-    formData.append('files', fs.createReadStream(file.path), {
-      filename: file.originalname.replace(/\.pdf$/i, '.docx'),
-      contentType: 'application/pdf',
-    });
-
+    // ─── STRATEGY 1: Gotenberg (if running) ────────────────────────────────
     try {
+      const formData = new FormData();
+      // IMPORTANT: send with .pdf extension — Gotenberg detects format by filename
+      formData.append('files', fs.createReadStream(file.path), {
+        filename: file.originalname.endsWith('.pdf') ? file.originalname : file.originalname + '.pdf',
+        contentType: 'application/pdf',
+      });
+
       const response = await axios.post(`${GOTENBERG_URL}/forms/libreoffice/convert`, formData, {
         headers: { ...formData.getHeaders() },
         responseType: 'arraybuffer',
-        timeout: 60000,
+        timeout: 90000, // 90s for large files
       });
 
       const docxBuffer = Buffer.from(response.data);
+
+      // Validate: Gotenberg should never return an empty buffer
+      if (!docxBuffer || docxBuffer.length < 100) {
+        throw new Error(`Gotenberg returned empty/invalid response (${docxBuffer?.length ?? 0} bytes)`);
+      }
+
+      console.log(`✅ [Gotenberg] Conversion success — ${docxBuffer.length} bytes`);
+
       const safeOutputName = file.originalname.replace(/\.pdf$/i, '') + '.docx';
       const uploadResult = await uploadToCloudinary(docxBuffer, safeOutputName, 'docx');
 
@@ -770,18 +788,107 @@ export const pdfToWord = async (req: Request, res: Response) => {
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
       });
 
-      res.json({
+      return res.json({
         success: true,
         message: 'Conversion completed successfully.',
         downloadUrl: uploadResult.secure_url,
         stats: { pages: totalPages, size: uploadResult.bytes }
       });
-    } catch (err: any) {
-      console.error('❌ Gotenberg PDF-to-Word Engine Failure:', err.message);
-      res.status(500).json({ success: false, error: 'Independent conversion engine failed. Please ensure Gotenberg is running on port 3000.' });
+    } catch (gotenbergErr: any) {
+      console.warn(`⚠️  [Gotenberg] Failed (${gotenbergErr.message}). Falling back to direct LibreOffice...`);
     }
+
+    // ─── STRATEGY 2: Direct LibreOffice exec (Linux server fallback) ───────
+    // Ensure temp directory exists
+    await fs.promises.mkdir(LIBREOFFICE_TEMP_DIR, { recursive: true });
+
+    // Write PDF to a unique temp file inside the known temp dir
+    const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const safePdfName = `input_${uniqueId}.pdf`;
+    inputPath = path.join(LIBREOFFICE_TEMP_DIR, safePdfName);
+    await fs.promises.writeFile(inputPath, pdfData);
+
+    // LibreOffice saves output in --outdir with the same base name, .docx extension
+    const baseName = path.basename(safePdfName, '.pdf');
+    outputPath = path.join(LIBREOFFICE_TEMP_DIR, `${baseName}.docx`);
+    profilePath = path.join(LIBREOFFICE_TEMP_DIR, `lo_profile_${uniqueId}`);
+
+    // Build the libreoffice command — proper quoting for paths with spaces
+    const loCommand = `libreoffice -env:UserInstallation=file://${profilePath} --headless --nologo --norestore --convert-to docx:"Microsoft Word 2007-2019 XML" --outdir "${LIBREOFFICE_TEMP_DIR}" "${inputPath}"`;
+
+    console.log(`▶️  [LibreOffice] Running: ${loCommand}`);
+
+    // AWAIT the exec — this is the critical fix.
+    // Without await the file doesn't exist yet when we try to read it.
+    const { stdout, stderr } = await execAsync(loCommand, { timeout: 120000 }); // 2 min max
+    console.log(`[LibreOffice stdout] ${stdout}`);
+    if (stderr) console.warn(`[LibreOffice stderr] ${stderr}`);
+
+    // Verify output file actually exists and is non-empty
+    let outputStat: fs.Stats;
+    try {
+      outputStat = await fs.promises.stat(outputPath);
+    } catch {
+      throw new Error(`LibreOffice did not produce output at expected path: ${outputPath}`);
+    }
+
+    if (outputStat.size < 100) {
+      throw new Error(`LibreOffice produced an empty/corrupt file (${outputStat.size} bytes) at: ${outputPath}`);
+    }
+
+    console.log(`✅ [LibreOffice] Output ready — ${outputStat.size} bytes at ${outputPath}`);
+
+    // Read the converted file into a buffer
+    const docxBuffer = await fs.promises.readFile(outputPath);
+
+    const safeOutputName = file.originalname.replace(/\.pdf$/i, '') + '.docx';
+    const uploadResult = await uploadToCloudinary(docxBuffer, safeOutputName, 'docx');
+
+    await saveMetadata({
+      originalName: file.originalname,
+      cloudinaryId: uploadResult.public_id,
+      url: uploadResult.secure_url,
+      type: 'docx',
+      size: uploadResult.bytes,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+
+    // Send response FIRST, then clean up — ensures files are never deleted mid-send
+    res.json({
+      success: true,
+      message: 'Conversion completed successfully.',
+      downloadUrl: uploadResult.secure_url,
+      stats: { pages: totalPages, size: uploadResult.bytes }
+    });
+
   } catch (error: any) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('❌ [pdfToWord] Critical failure:', error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  } finally {
+    // ─── CLEANUP: runs after response is fully sent ─────────────────────
+    // Using setImmediate pushes cleanup to the next event loop tick,
+    // guaranteeing the response has been dispatched first.
+    // Running cleanup via setImmediate
+    setImmediate(async () => {
+      const pathsToClean = [inputPath, outputPath, profilePath].filter(Boolean);
+      for (const p of pathsToClean) {
+        try {
+          const stat = await fs.promises.stat(p).catch(() => null);
+          if (stat) {
+            if (stat.isDirectory()) {
+              await fs.promises.rm(p, { recursive: true, force: true });
+            } else {
+              await fs.promises.unlink(p);
+            }
+          }
+          console.log(`🗑️  [Cleanup] Deleted: ${p}`);
+        } catch {
+          // File may already not exist — silently ignore
+        }
+      }
+    });
   }
 };
 
